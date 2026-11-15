@@ -50,6 +50,11 @@ export type AgentEvent =
       }
     /** 工具执行出错时触发，error 为错误描述 */
     | { type: "tool_error"; toolName: string; error: string; step: number }
+    /**
+     * 外置任务计划更新（Agent 调用 update_plan 后触发）。
+     * items 为全量清单，直接整体替换前端状态即可，无需做增量合并。
+     */
+    | { type: "plan_update"; items: PlanItem[] }
     /** Agent 循环结束时的最终回复消息（Agent 模式下由 parseAgentResponse 解析出的 final 结果） */
     | { type: "assistant"; message: string }
     /**
@@ -120,6 +125,17 @@ export type DebugEvent = {
 };
 
 /**
+ * 外置任务计划（todo）的单项。
+ * 与后端 src/events/event-bus.ts 的 PlanItem 保持一致。
+ */
+export type PlanItemStatus = "pending" | "in_progress" | "completed";
+
+export type PlanItem = {
+    content: string;
+    status: PlanItemStatus;
+};
+
+/**
  * 前端消息类型。
  * 注意：这与后端的 ChatMessage（src/memory/types.ts）不同，
  * 前端版本增加了 id、timestamp、toolEvents、debugEvents 等 UI 专用字段。
@@ -137,6 +153,11 @@ export type ChatMessage = {
     toolEvents?: ToolEvent[];
     /** Debug 模式下展示的步骤原始输出列表 */
     debugEvents?: DebugEvent[];
+    /**
+     * 本轮任务的外置计划快照（仅助手消息）。
+     * 运行中随 plan_update 实时刷新，run 结束时定格为最终状态。
+     */
+    planItems?: PlanItem[];
 };
 
 /** 单次工具调用的状态记录，前端用于渲染工具执行状态的 Tag 标签 */

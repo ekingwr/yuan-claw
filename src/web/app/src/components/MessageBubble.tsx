@@ -1,8 +1,8 @@
 import React, { useEffect, useRef } from "react";
 import { Tag, Tooltip, Typography, Avatar, Collapse, Image } from "antd";
-import { CheckCircleOutlined, LoadingOutlined, CloseCircleOutlined, CodeOutlined, PaperClipOutlined } from "@ant-design/icons";
+import { CheckCircleOutlined, LoadingOutlined, CloseCircleOutlined, CodeOutlined, PaperClipOutlined, OrderedListOutlined } from "@ant-design/icons";
 import { Bubble } from "@ant-design/x";
-import type { ChatMessage, DebugEvent, ToolEvent } from "../types";
+import type { ChatMessage, DebugEvent, PlanItem, ToolEvent } from "../types";
 
 const { Text } = Typography;
 
@@ -140,13 +140,93 @@ function DebugEventsPanel({ events }: { events: DebugEvent[] }) {
     );
 }
 
+/**
+ * 外置任务计划面板。
+ *
+ * 后端把计划外置成独立状态、每步钉回模型上下文末尾以防长任务跑偏；
+ * 这里把它同样展示给用户，让「Agent 现在做到哪一步、还剩什么」始终可见。
+ * 运行中随 plan_update 实时刷新，run 结束后定格为该轮的最终清单。
+ */
+function PlanPanel({ items }: { items: PlanItem[] }) {
+    if (!items.length) return null;
+
+    const completed = items.filter((item) => item.status === "completed").length;
+
+    return (
+        <div
+            style={{
+                marginBottom: 8,
+                padding: "8px 10px",
+                background: "#f6ffed",
+                border: "1px solid #b7eb8f",
+                borderRadius: 6,
+            }}
+        >
+            <div
+                style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    marginBottom: 6,
+                }}
+            >
+                <Text style={{ fontSize: 12, color: "#389e0d" }}>
+                    <OrderedListOutlined style={{ marginRight: 4 }} />
+                    任务计划
+                </Text>
+                <Text style={{ fontSize: 12, color: "#8c8c8c" }}>
+                    {completed}/{items.length}
+                </Text>
+            </div>
+            {items.map((item, i) => (
+                <div
+                    key={i}
+                    style={{
+                        display: "flex",
+                        alignItems: "flex-start",
+                        gap: 6,
+                        fontSize: 12,
+                        lineHeight: 1.8,
+                    }}
+                >
+                    {item.status === "completed" ? (
+                        <CheckCircleOutlined style={{ color: "#52c41a", marginTop: 4 }} />
+                    ) : item.status === "in_progress" ? (
+                        <LoadingOutlined style={{ color: "#1677ff", marginTop: 4 }} />
+                    ) : (
+                        <span
+                            style={{
+                                flex: "0 0 auto",
+                                width: 8,
+                                height: 8,
+                                marginTop: 8,
+                                borderRadius: "50%",
+                                border: "1px solid #d9d9d9",
+                            }}
+                        />
+                    )}
+                    <span
+                        style={{
+                            color: item.status === "pending" ? "#8c8c8c" : "#262626",
+                            textDecoration:
+                                item.status === "completed" ? "line-through" : undefined,
+                            wordBreak: "break-word",
+                        }}
+                    >
+                        {item.content}
+                    </span>
+                </div>
+            ))}
+        </div>
+    );
+}
+
 interface MessageBubbleProps {
     message: ChatMessage;
     isTyping?: boolean;
     isStreaming?: boolean;
     debug?: boolean;
 }
-
 export const MessageBubble: React.FC<MessageBubbleProps> = ({
     message,
     isTyping = false,
@@ -172,6 +252,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             {debug && message.debugEvents && message.debugEvents.length > 0 && (
                 <DebugEventsPanel events={message.debugEvents} />
             )}
+            {message.planItems && <PlanPanel items={message.planItems} />}
             {message.toolEvents && message.toolEvents.length > 0 && (
                 <ToolEventsBar events={message.toolEvents} />
             )}

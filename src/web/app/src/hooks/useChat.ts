@@ -6,6 +6,7 @@ import type {
     ChatMode,
     DebugEvent,
     ImageAttachment,
+    PlanItem,
     ToolEvent,
     Workspace,
 } from "../types";
@@ -70,6 +71,8 @@ export function useChat() {
 
     const currentToolEvents = useRef<Map<string, ToolEvent>>(new Map());
     const currentDebugEvents = useRef<DebugEvent[]>([]);
+    /** 本轮任务的外置计划；plan_update 每次全量替换，run_start 时清空 */
+    const currentPlanItems = useRef<PlanItem[]>([]);
     const sessionIdRef = useRef<string | null>(null);
     const modeRef = useRef<ChatMode>("agent");
 
@@ -87,6 +90,7 @@ export function useChat() {
         setIsStreaming(false);
         currentToolEvents.current.clear();
         currentDebugEvents.current = [];
+        currentPlanItems.current = [];
     }, []);
 
     /**
@@ -144,6 +148,8 @@ export function useChat() {
                 setIsProcessing(true);
                 currentToolEvents.current.clear();
                 currentDebugEvents.current = [];
+                // 计划是单次任务的脚手架：新一轮开始即丢弃上一轮的清单
+                currentPlanItems.current = [];
                 const assistantMsg: ChatMessage = {
                     id: `assistant-${Date.now()}`,
                     role: "assistant",
@@ -151,6 +157,7 @@ export function useChat() {
                     timestamp: Date.now(),
                     toolEvents: [],
                     debugEvents: [],
+                    planItems: [],
                 };
                 setCurrentAssistantMsg(assistantMsg);
                 break;
@@ -253,6 +260,15 @@ export function useChat() {
                 break;
             }
 
+            // 外置任务计划更新：服务端发来的是全量清单，直接整体替换
+            case "plan_update": {
+                currentPlanItems.current = event.items;
+                setCurrentAssistantMsg((prev) =>
+                    prev ? { ...prev, planItems: event.items } : prev,
+                );
+                break;
+            }
+
             // Agent 最终回复：将占位消息固化到消息列表中，清空占位
             case "assistant":
                 setCurrentAssistantMsg((prev) => {
@@ -263,6 +279,8 @@ export function useChat() {
                         timestamp: Date.now(),
                         toolEvents: prev?.toolEvents ?? [],
                         debugEvents: prev?.debugEvents ?? [],
+                        // 定格本轮的最终计划状态，作为该轮对话的一部分留存展示
+                        planItems: prev?.planItems ?? [],
                     };
                     setMessages((prevMsgs) => [...prevMsgs, msg]);
                     return null; // 清空占位消息
