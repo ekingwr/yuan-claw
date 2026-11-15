@@ -5,6 +5,11 @@ import { buildSystemPrompt } from "./build-system-prompt.js";
 import type { WorkspaceContext } from "./build-system-prompt.js";
 import { parseAgentResponse } from "./parse-agent-response.js";
 import { createSpawnAgentTool, createSpawnAgentsTool } from "./subagent.js";
+import {
+    buildPlanReminder,
+    createPlanState,
+    createPlanTool,
+} from "./plan.js";
 import type { ApprovalDecision } from "./read-approval.js";
 import { SkillsRuntime } from "../skills/runtime.js";
 import { compressHistory, COMPRESSION_THRESHOLD } from "./compress-history.js";
@@ -196,6 +201,25 @@ export async function runLocalAgentLoop(
         effectiveTools.set(spawnManyTool.name, spawnManyTool);
     }
 
+    /**
+     * ===== 外置计划（todo） =====
+     *
+     * 只注入给协调者（depth===0）：专家的任务足够窄、步数上限也更紧，
+     * 为它单独规划纯属开销。子智能体的工具集由 selectSubagentTools 从**原始**
+     * tools 中筛选，而 update_plan 只挂在协调者的 effectiveTools 上，
+     * 因此不会随委派下传——无需额外排除逻辑。
+     *
+     * planState 是循环内的可变引用：工具负责写，每步构建上下文时负责读。
+     */
+    const planState = createPlanState();
+    if (depth === 0) {
+        const planTool = createPlanTool(planState, eventBus);
+        if (effectiveTools === tools) {
+            effectiveTools = new Map(tools);
+        }
+        effectiveTools.set(planTool.name, planTool);
+    }
+
     // Load skills and use LLM planning to select relevant ones.
     // 子智能体（depth>0）跳过技能规划：保持精简、减少一次 LLM 调用，
     // 技能主要服务于面向用户的主协调者。
@@ -271,11 +295,29 @@ export async function runLocalAgentLoop(
             await persistMessages(messages, onMessagesUpdated);
         }
 
+        /**
+         * ===== 上下文末尾的「方向性」注入 =====
+         *
+         * 计划与任务锚点都属于同一类东西：不产生新信息，只是把模型容易忘掉的方向
+         * 重新钉到注意力最强的位置。两者都是瞬时的——只拼进送给模型的数组，
+         * 不写入 messages，因此不落盘、不随步数累积、也不参与历史压缩。
+         *
+         * 顺序：计划在前，任务锚点压轴。
+         */
+        const tailContext: ChatMessage[] = [];
+
+        const planReminder = buildPlanReminder(planState);
+        if (planReminder) {
+            tailContext.push(planReminder);
+        }
+
         // 锚点只在第 2 步起注入：第 1 步 messages 末尾就是 userInput 本身，无需重复。
+        if (step > 1 && countMessagesChars(messages) > GOAL_ANCHOR_MIN_CHARS) {
+            tailContext.push(buildGoalAnchor(userInput, step));
+        }
+
         const modelMessages =
-            step > 1 && countMessagesChars(messages) > GOAL_ANCHOR_MIN_CHARS
-                ? [...messages, buildGoalAnchor(userInput, step)]
-                : messages;
+            tailContext.length > 0 ? [...messages, ...tailContext] : messages;
 
         let rawOutput: string;
 

@@ -1,3 +1,16 @@
+/**
+ * 外置计划（todo）的单项状态。
+ *
+ * 定义放在事件模块而非 agent/plan.ts，是为了让 event-bus 保持零 import：
+ * 事件类型是 CLI、Web、子智能体三方共用的契约，不应反向依赖 agent 内部实现。
+ */
+export type PlanItemStatus = "pending" | "in_progress" | "completed";
+
+export type PlanItem = {
+    content: string;
+    status: PlanItemStatus;
+};
+
 export type AgentEvent =
     | { type: "run_start"; input: string }
     | {
@@ -7,6 +20,7 @@ export type AgentEvent =
         taskAnalysis: string;
         fallback: boolean;
     }
+    | { type: "plan_update"; items: PlanItem[] }
     | { type: "model_raw"; text: string; step: number }
     | { type: "tool_start"; toolName: string; args: unknown; step: number }
     | {
@@ -60,6 +74,24 @@ function printToolResultPreview(result: unknown) {
     } catch {
         console.log(String(result));
     }
+}
+
+const PLAN_STATUS_ICONS: Record<PlanItemStatus, string> = {
+    pending: "[ ]",
+    in_progress: "[~]",
+    completed: "[x]",
+};
+
+/**
+ * 把计划渲染成带编号与状态标记的清单文本。
+ *
+ * 导出给 agent/plan.ts 复用：CLI 展示与注入模型上下文必须是同一套标记，
+ * 否则用户看到的进度和模型理解的进度会对不上。
+ */
+export function formatPlanItems(items: PlanItem[]): string {
+    return items
+        .map((item, i) => `${PLAN_STATUS_ICONS[item.status]} ${i + 1}. ${item.content}`)
+        .join("\n");
 }
 
 let processingTimer: ReturnType<typeof setInterval> | null = null;
@@ -133,6 +165,11 @@ export function createConsoleEventBus(
                     );
                 }
 
+                // 外置计划：非 debug 模式也展示，让用户看到长任务的推进进度
+                if (!quiet && event.type === "plan_update") {
+                    console.log(`\n📋 任务计划：\n${formatPlanItems(event.items)}`);
+                }
+
                 // Show processing indicator on run_start, hide on run_end
                 if (event.type === "run_start") {
                     showProcessing();
@@ -162,6 +199,11 @@ export function createConsoleEventBus(
                         console.log(`[planning] 无需加载 Skill`);
                     }
                     console.log(`[planning] 执行计划: ${event.plan}`);
+                    break;
+
+                case "plan_update":
+                    console.log(`\n[plan_update] ${event.items.length} 项`);
+                    console.log(formatPlanItems(event.items));
                     break;
 
                 case "model_raw":

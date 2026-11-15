@@ -69,6 +69,9 @@ export function buildSystemPrompt(
         (tool) => tool.name === "spawn_agent" || tool.name === "spawn_agents"
     );
 
+    // update_plan 只注入给协调者，子智能体的工具集里没有它，因此这里无需再判 agentRole。
+    const hasPlanTool = tools.some((tool) => tool.name === "update_plan");
+
     // 主协调者与子智能体（专家）使用不同的身份说明与收尾指令。
     const identity = agentRole
         ? [
@@ -105,6 +108,17 @@ export function buildSystemPrompt(
             0,
             "- 当某个子任务需要大量检索/阅读/探索（会产生很多中间信息）时，优先用 spawn_agent 委派给只读子智能体：它拥有独立上下文、只回传提炼后的结论，可避免撑爆你的上下文。委派时务必把子任务背景写清楚，因为它看不到当前对话。",
             "- 当有多个彼此独立、互不依赖的子任务时，用 spawn_agents 一次性并发委派（tasks 为任务数组，全部完成后汇总回传）；若子任务之间有先后依赖，则用多次 spawn_agent 串行处理。"
+        );
+    }
+
+    // 拥有计划工具时，加入外置计划（todo）的使用规则。
+    if (hasPlanTool) {
+        toolRules.splice(
+            toolRules.length - 1,
+            0,
+            "- 当任务需要 3 步以上、或会跨多个文件/多个阶段时，先调用 update_plan 建立一份计划（每项一句话，status 填 pending），再开始执行；一两步就能完成的简单任务不要建计划。",
+            "- 计划会在之后每一步都展示给你。每完成一项就调用 update_plan 全量重写清单：把该项标为 completed，把下一项标为 in_progress。同一时刻只应有一项 in_progress。",
+            "- 以计划为准推进，不要顺手去做用户没有要求的事情；确实需要改路线时，先用 update_plan 改写计划，再按新计划执行。"
         );
     }
 
