@@ -790,9 +790,6 @@ async function runAgentLoop(
         new Set(session.ws ? [session.ws] : []),
     );
 
-    // Send run_start to the specific WebSocket
-    sendJson(session.ws, { type: "run_start", input: userInput });
-
     try {
         const result = await runLocalAgentLoop({
             userInput,
@@ -831,9 +828,6 @@ async function runDirectLLMHandler(
     const eventBus = createWebEventBusBroadcast(
         new Set(session.ws ? [session.ws] : []),
     );
-
-    // Send run_start to the specific WebSocket
-    sendJson(session.ws, { type: "run_start", input: userInput });
 
     try {
         const result = await runDirectLLM({
