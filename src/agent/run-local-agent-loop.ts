@@ -7,7 +7,8 @@ import { parseAgentResponse } from "./parse-agent-response.js";
 import { createSpawnAgentTool, createSpawnAgentsTool } from "./subagent.js";
 import type { ApprovalDecision } from "./read-approval.js";
 import { SkillsRuntime } from "../skills/runtime.js";
-import { compressHistoryIfNeeded } from "./compress-history.js";
+import { compressHistory, COMPRESSION_THRESHOLD } from "./compress-history.js";
+import { countMessagesChars } from "../memory/message-chars.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -108,6 +109,35 @@ async function persistMessages(
     }
 }
 
+/**
+ * ===== 任务锚点（防止长任务跑偏） =====
+ *
+ * ReAct 循环里模型看到的是「最近若干条工具输出」，注意力天然偏向序列尾部。
+ * 任务一长，最初的用户诉求会被推到几万 token 之外，甚至被历史压缩成摘要，
+ * 于是模型开始优化子目标（例如「让这条命令跑通」）而不是回答用户的原始问题。
+ *
+ * 对策是每一步都把原始诉求原文重新钉在上下文末尾——最强注意力的位置。
+ *
+ * 两个关键设计：
+ *   1. 锚点是「瞬时」的：只拼进送给模型的数组，不写入 messages，
+ *      因此不会持久化进 session，也不会随步数累积。
+ *   2. 有长度门槛：短任务里原始诉求本来就在视野内，重复注入纯属浪费 token。
+ */
+const GOAL_ANCHOR_MIN_CHARS = 50_000;
+const GOAL_ANCHOR_MAX_CHARS = 2_000;
+
+function buildGoalAnchor(userInput: string, step: number): ChatMessage {
+    return {
+        role: "user",
+        content: [
+            `[任务锚点 · 第 ${step} 步]`,
+            "以下是用户最初的原始需求，请勿偏离：",
+            trimText(userInput, GOAL_ANCHOR_MAX_CHARS),
+            "在决定下一步之前，先确认它是否直接服务于上述原始需求；若不是，请回到主线。",
+        ].join("\n"),
+    };
+}
+
 export async function runLocalAgentLoop(
     params: RunLocalAgentLoopParams,
 ): Promise<{ finalMessage: string; approvalMode: ApprovalMode }> {
@@ -185,17 +215,11 @@ export async function runLocalAgentLoop(
         (message) => message.role !== "system",
     );
 
-    // 如果历史对话超过 100,000 字符，调用 LLM 进行压缩
-    const compressedHistory = await compressHistoryIfNeeded(
-        historyMessages,
-        modelClient,
-    );
-
     /**
      * ===== 多步骤记忆（Agent 模式特有） =====
      *
      * messages 数组是整个 Agent 循环的"记忆核心"。
-     * 初始内容：[system prompt, ...压缩后的历史对话, 本次用户输入]
+     * 初始内容：[system prompt, ...历史对话, 本次用户输入]
      *
      * 在后续的 for 循环中，每一步都会往这个数组追加新消息：
      *   - LLM 的原始输出（assistant）
@@ -209,9 +233,12 @@ export async function runLocalAgentLoop(
      *
      * ===== 对话记忆压缩 =====
      *
-     * 当历史对话超过 100,000 字符时，会通过 compressHistoryIfNeeded 调用 LLM
-     * 将较早的消息压缩为结构化摘要，保留最近 6 条消息原文。
-     * 这样既保证了 LLM 上下文窗口不溢出，又保留了重要的对话信息。
+     * 压缩在循环内、每次进模型之前判断（而非只在循环前做一次）：Web 端
+     * maxSteps 高达 9999，单次任务可能跑几百步，只在开头压缩意味着上下文
+     * 只增不减，直到模型 API 因超长直接报错。
+     *
+     * 超过 COMPRESSION_THRESHOLD 时调用 compressHistory，把较早的消息压成
+     * 结构化摘要，同时钉住首条消息原文、保留最近 PRESERVE_RECENT_COUNT 条原文。
      */
     const messages: ChatMessage[] = [
         {
@@ -223,7 +250,7 @@ export async function runLocalAgentLoop(
                 workspace,
             ),
         },
-        ...compressedHistory,
+        ...historyMessages,
         {
             role: "user",
             content: userInput,
@@ -236,10 +263,24 @@ export async function runLocalAgentLoop(
         // Agent 多步骤循环：每步调 LLM → 解析 → 执行工具 → 追加结果到 messages。
         // 循环上限为 maxSteps 步，超出后抛出错误。
         for (let step = 1; step <= maxSteps; step += 1) {
+        // 进模型前按需压缩历史（原地替换 messages 内容，并同步持久化）
+        if (countMessagesChars(messages) > COMPRESSION_THRESHOLD) {
+            const compressed = await compressHistory(messages, modelClient);
+            messages.length = 0;
+            messages.push(...compressed);
+            await persistMessages(messages, onMessagesUpdated);
+        }
+
+        // 锚点只在第 2 步起注入：第 1 步 messages 末尾就是 userInput 本身，无需重复。
+        const modelMessages =
+            step > 1 && countMessagesChars(messages) > GOAL_ANCHOR_MIN_CHARS
+                ? [...messages, buildGoalAnchor(userInput, step)]
+                : messages;
+
         let rawOutput: string;
 
         try {
-            rawOutput = await modelClient.generate(messages);
+            rawOutput = await modelClient.generate(modelMessages);
         } catch (error) {
             const errorMessage =
                 error instanceof Error ? error.message : String(error);

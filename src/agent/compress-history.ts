@@ -8,8 +8,17 @@ type ModelClient = {
 /** 历史对话压缩阈值：超过此字符数时触发 LLM 压缩 */
 export const COMPRESSION_THRESHOLD = 1_000_000;
 
-/** 压缩后保留最近的消息数量（不压缩，保持原文） */
-const PRESERVE_RECENT_COUNT = 6;
+/**
+ * 压缩后保留最近的消息数量（不压缩，保持原文）。
+ *
+ * ReAct 循环每一步产生 2 条消息（assistant 的 tool_call + user 的工具结果），
+ * 因此这个值除以 2 才是模型能原文回看的「步数」。取值 20 即保留最近约 10 步，
+ * 让模型在压缩发生后仍有足够的近期细节做判断，而不是只看到 3 步就开始跑偏。
+ *
+ * 上界受 MAX_COMPRESS_INPUT 约束：单条工具结果最多 12000 字符，
+ * 20 条约 240k 字符，剩余的 760k 仍落在 800k 的压缩输入预算内。
+ */
+const PRESERVE_RECENT_COUNT = 20;
 
 /**
  * 送入压缩模型的最大字符数，超出部分取头尾各一半。
@@ -61,6 +70,7 @@ const COMPRESSION_SYSTEM_PROMPT = `你是一个对话历史压缩助手。你的
 [对话截止时的状态：正在做什么、下一步计划等]
 
 注意：
+- 「用户目标」必须忠实还原用户最初的原话诉求，不要改写成执行过程中衍生出的子目标
 - 不要遗漏任何工具调用的关键结果（如文件内容、搜索结果的重要部分）
 - 代码相关的对话要保留关键代码逻辑的描述
 - 压缩后的摘要应该足够详细，使得后续的 LLM 能够基于此摘要继续对话而不丢失上下文`;
@@ -69,7 +79,11 @@ const COMPRESSION_SYSTEM_PROMPT = `你是一个对话历史压缩助手。你的
  * 压缩历史对话（无条件执行）。
  *
  * 将较早的消息通过 LLM 压缩为结构化摘要，保留最近 N 条消息原文不变。
- * 返回压缩后的消息数组：[...system 消息, 压缩摘要(user角色), ...最近N条原文消息]
+ * 返回压缩后的消息数组：
+ *   [...system 消息, 首条消息原文, 压缩摘要(user角色), ...最近N条原文消息]
+ *
+ * 首条消息（通常是对话的起点）被单独钉住、永不参与压缩：多次压缩会让摘要
+ * 退化成「摘要的摘要」，把最初的需求逐轮稀释掉，钉住原文可以杜绝这条路径。
  *
  * 由 compressHistoryIfNeeded（自动触发）与 Web 端「手动压缩」按钮共用。
  */
@@ -83,14 +97,15 @@ export async function compressHistory(
     const systemMessages = messages.filter((m) => m.role === "system");
     const nonSystemMessages = messages.filter((m) => m.role !== "system");
 
-    if (nonSystemMessages.length <= PRESERVE_RECENT_COUNT) {
-        // 消息太少无法压缩，直接返回
+    if (nonSystemMessages.length <= PRESERVE_RECENT_COUNT + 1) {
+        // 除去钉住的首条后，剩余消息不足以再切出「待压缩」段，直接返回
         return messages;
     }
 
-    // 分为需要压缩的旧消息和保留原文的最近消息
-    const olderMessages = nonSystemMessages.slice(0, -PRESERVE_RECENT_COUNT);
-    const recentMessages = nonSystemMessages.slice(-PRESERVE_RECENT_COUNT);
+    // 首条钉住；其余再分为需要压缩的旧消息和保留原文的最近消息
+    const [pinnedFirstMessage, ...restMessages] = nonSystemMessages;
+    const olderMessages = restMessages.slice(0, -PRESERVE_RECENT_COUNT);
+    const recentMessages = restMessages.slice(-PRESERVE_RECENT_COUNT);
 
     const serializedHistory = serializeMessages(olderMessages);
 
@@ -118,15 +133,20 @@ export async function compressHistory(
             content: `[以下是之前对话的压缩摘要，共 ${olderMessages.length} 条消息，原始约 ${totalChars} 字符]\n\n${compressionResult}`,
         };
 
-        // 返回：system 消息 + 压缩摘要 + 最近消息
-        return [...systemMessages, summaryMessage, ...recentMessages];
+        // 返回：system 消息 + 钉住的首条原文 + 压缩摘要 + 最近消息
+        return [
+            ...systemMessages,
+            pinnedFirstMessage,
+            summaryMessage,
+            ...recentMessages,
+        ];
     } catch (error) {
-        // 压缩失败时降级：仅保留最近的消息（不做 LLM 压缩）
+        // 压缩失败时降级：仅保留钉住的首条与最近的消息（不做 LLM 压缩）
         console.warn(
             "[compress-history] LLM compression failed, falling back to recent messages only:",
             error instanceof Error ? error.message : String(error),
         );
-        return [...systemMessages, ...recentMessages];
+        return [...systemMessages, pinnedFirstMessage, ...recentMessages];
     }
 }
 
