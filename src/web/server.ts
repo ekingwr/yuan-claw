@@ -14,6 +14,7 @@ import { SessionStore } from "../memory/session-store.js";
 import { WorkspaceStore } from "../memory/workspace-store.js";
 import { countMessagesChars } from "../memory/message-chars.js";
 import { createWebEventBusBroadcast } from "../events/web-event-bus.js";
+import { trackTerminalEvents } from "../events/terminal-events.js";
 import { runLocalAgentLoop } from "../agent/run-local-agent-loop.js";
 import { runDirectLLM } from "../agent/run-direct-llm.js";
 import { compressHistory, COMPRESSION_THRESHOLD } from "../agent/compress-history.js";
@@ -389,7 +390,7 @@ async function main() {
                     sendJson(session.ws, {
                         type: "run_error",
                         step: 0,
-                        stage: "model_generate" as const,
+                        stage: "server" as const,
                         error: err instanceof Error ? err.message : String(err),
                     });
                 }
@@ -779,6 +780,33 @@ function persistSession(
     });
 }
 
+/**
+ * 为本轮运行创建事件总线，同时返回「是否已发过终止信号」的查询函数。
+ *
+ * 循环抛出的异常分两种：已经 emit 过 run_error / run_end 的（模型调用失败、
+ * 超出步数上限），和什么都没发的（历史压缩、消息落盘、技能规划异常）。
+ * 后者若不补发，前端收不到任何信号，isProcessing 会永远停在 true。
+ */
+function createRunEventBus(ws: WebSocket | null) {
+    return trackTerminalEvents(createWebEventBusBroadcast(new Set(ws ? [ws] : [])));
+}
+
+/** 兜底上报：仅在本轮尚未发过终止信号时补发一条 run_error，避免重复提示 */
+function reportLoopFailure(
+    ws: WebSocket | null,
+    hasTerminated: () => boolean,
+    error: unknown,
+): void {
+    if (hasTerminated()) return;
+
+    sendJson(ws, {
+        type: "run_error",
+        step: 0,
+        stage: "server",
+        error: error instanceof Error ? error.message : String(error),
+    });
+}
+
 async function runAgentLoop(
     userInput: string,
     session: ChatSession,
@@ -786,9 +814,7 @@ async function runAgentLoop(
     modelClient: ModelClient,
     sessionStore: SessionStore,
 ) {
-    const eventBus = createWebEventBusBroadcast(
-        new Set(session.ws ? [session.ws] : []),
-    );
+    const { bus: eventBus, hasTerminated } = createRunEventBus(session.ws);
 
     try {
         const result = await runLocalAgentLoop({
@@ -815,6 +841,7 @@ async function runAgentLoop(
         console.log(`[web] Session ${session.id}: ${result.finalMessage.slice(0, 100)}...`);
     } catch (error) {
         console.error(`[web] Session ${session.id} error:`, error);
+        reportLoopFailure(session.ws, hasTerminated, error);
     }
 }
 
@@ -825,9 +852,7 @@ async function runDirectLLMHandler(
     modelClient: ModelClient,
     sessionStore: SessionStore,
 ) {
-    const eventBus = createWebEventBusBroadcast(
-        new Set(session.ws ? [session.ws] : []),
-    );
+    const { bus: eventBus, hasTerminated } = createRunEventBus(session.ws);
 
     try {
         const result = await runDirectLLM({
@@ -843,6 +868,7 @@ async function runDirectLLMHandler(
         console.log(`[web:direct] Session ${session.id}: ${result.finalMessage.slice(0, 100)}...`);
     } catch (error) {
         console.error(`[web:direct] Session ${session.id} error:`, error);
+        reportLoopFailure(session.ws, hasTerminated, error);
     }
 }
 

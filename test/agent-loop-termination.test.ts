@@ -171,3 +171,33 @@ test("模型调用失败是致命错误：发 run_error(model_generate) 后抛�
     assert.equal(countType(events, "assistant"), 0);
     assert.equal(runEnds(events).length, 0, "致命路径不发 run_end，前端只能靠 run_error 收尾");
 });
+
+test("循环外的阶段异常不带任何终止事件，Web 层必须自行补发 run_error", async () => {
+    const events: AgentEvent[] = [];
+    const model = wrapModel(() => TOOL_CALL_ECHO);
+
+    // 落盘回调抛错，模拟历史压缩 / 会话持久化 / 技能规划这一类循环外异常
+    await assert.rejects(
+        runLocalAgentLoop({
+            userInput: "测试任务",
+            modelClient: model,
+            tools: new Map([["echo", ECHO_TOOL]]),
+            eventBus: makeBus(events),
+            maxSteps: 3,
+            previousMessages: [],
+            depth: 0,
+            onMessagesUpdated: async () => {
+                throw new Error("磁盘写入失败");
+            },
+        }),
+        /磁盘写入失败/,
+    );
+
+    assert.equal(runEnds(events).length, 0);
+    assert.equal(runErrors(events).length, 0);
+    assert.equal(
+        events.some((e) => e.type === "run_end" || e.type === "run_error"),
+        false,
+        "前端收不到任何终止信号，若服务端不补发就会永远停在 isProcessing",
+    );
+});

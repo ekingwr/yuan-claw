@@ -36,7 +36,11 @@ export type AgentEvent =
     | {
     type: "run_error";
     step: number;
-    stage: "model_generate" | "parse_agent_response" | "confirmation";
+    /**
+     * 出错阶段。前三者由 Agent 循环内部 emit；server 是循环之外的服务端异常
+     * （压缩、落盘、技能规划等），由 Web 层的兜底 catch 补发。
+     */
+    stage: "model_generate" | "parse_agent_response" | "confirmation" | "server";
     error: string;
 }
     | {

@@ -63,11 +63,16 @@ export type AgentEvent =
      * 前端收到后逐字累加到当前消息内容，实现打字机效果。
      */
     | { type: "streaming_token"; text: string; done: boolean }
-    /** Agent 循环运行出错时触发，stage 标识出错阶段，error 为错误信息 */
+    /**
+     * Agent 循环运行出错时触发，error 为错误信息。
+     *
+     * stage 与后端 src/events/event-bus.ts 保持一致。其中 parse_agent_response
+     * 是**可恢复**错误（服务端塞入纠正提示后循环继续），其余阶段本轮即终止。
+     */
     | {
           type: "run_error";
           step: number;
-          stage: string;
+          stage: "model_generate" | "parse_agent_response" | "confirmation" | "server";
           error: string;
       }
     /** Agent 循环正常结束，reason 为 "final"（得到最终回答）或 "max_steps_exceeded"（超出最大步数） */
