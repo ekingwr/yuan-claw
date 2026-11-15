@@ -58,6 +58,25 @@ export function useChat() {
     const [isProcessing, setIsProcessing] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
     const [currentAssistantMsg, setCurrentAssistantMsg] = useState<ChatMessage | null>(null);
+    /**
+     * 占位消息的 ref 镜像，与上面的 state 同步写入。
+     *
+     * 事件处理器需要在 setState 之外同步读到占位消息的当前内容（收尾时判断是否
+     * 残留了工具标签、计划清单或流式文本），只靠 state 拿不到。
+     *
+     * 顺带修掉一个隐患：固化占位消息时不能再把 setMessages 嵌进更新函数里。
+     * 更新函数必须是纯的，StrictMode 下会被重复调用，嵌套写入会把消息追加两次。
+     */
+    const assistantMsgRef = useRef<ChatMessage | null>(null);
+    const setAssistantMsg = useCallback(
+        (next: ChatMessage | null | ((prev: ChatMessage | null) => ChatMessage | null)) => {
+            const resolved =
+                typeof next === "function" ? next(assistantMsgRef.current) : next;
+            assistantMsgRef.current = resolved;
+            setCurrentAssistantMsg(resolved);
+        },
+        [],
+    );
     const [mode, setMode] = useState<ChatMode>("agent");
     const [debug, setDebug] = useState(false);
 
@@ -82,16 +101,45 @@ export function useChat() {
         modeRef.current = newMode;
     }, []);
 
+    /**
+     * 收尾占位消息：把本轮残留的痕迹固化成一条助手消息，或者在完全空转时直接丢弃。
+     *
+     * 正常路径下 assistant 事件已经固化过，这里是兜底——异常终止（模型调用失败、
+     * 确认阶段抛错、超出步数上限）不会发 assistant，占位消息若不清掉就会一直挂在
+     * 列表末尾，渲染成一个只有工具标签、没有正文的空气泡。
+     */
+    const flushAssistantPlaceholder = useCallback(
+        (fallbackContent?: string) => {
+            const pending = assistantMsgRef.current;
+            if (!pending) return;
+
+            setAssistantMsg(null);
+
+            const hasTrace =
+                pending.content.length > 0 ||
+                (pending.toolEvents?.length ?? 0) > 0 ||
+                (pending.debugEvents?.length ?? 0) > 0 ||
+                (pending.planItems?.length ?? 0) > 0;
+            if (!hasTrace) return;
+
+            setMessages((prev) => [
+                ...prev,
+                { ...pending, content: pending.content || fallbackContent || "" },
+            ]);
+        },
+        [setAssistantMsg],
+    );
+
     /** 清空当前会话的 UI 状态（切换会话 / 新建会话时调用） */
     const resetConversationUi = useCallback(() => {
         setMessages([]);
-        setCurrentAssistantMsg(null);
+        setAssistantMsg(null);
         setIsProcessing(false);
         setIsStreaming(false);
         currentToolEvents.current.clear();
         currentDebugEvents.current = [];
         currentPlanItems.current = [];
-    }, []);
+    }, [setAssistantMsg]);
 
     /**
      * 处理服务端通过 WebSocket 推送的各类 AgentEvent。
@@ -159,7 +207,7 @@ export function useChat() {
                     debugEvents: [],
                     planItems: [],
                 };
-                setCurrentAssistantMsg(assistantMsg);
+                setAssistantMsg(assistantMsg);
                 break;
 
             // 模型原始输出：Agent 模式下每步 LLM 返回的完整 JSON，收集到 debugEvents 供 Debug 面板展示
@@ -169,7 +217,7 @@ export function useChat() {
                     text: event.text,
                 };
                 currentDebugEvents.current = [...currentDebugEvents.current, debugEvent];
-                setCurrentAssistantMsg((prev) =>
+                setAssistantMsg((prev) =>
                     prev
                         ? { ...prev, debugEvents: currentDebugEvents.current }
                         : prev,
@@ -186,7 +234,7 @@ export function useChat() {
                 }
                 setIsStreaming(true);
                 // 将文本片段追加到当前助手消息的 content
-                setCurrentAssistantMsg((prev) => {
+                setAssistantMsg((prev) => {
                     if (!prev) return prev;
                     return {
                         ...prev,
@@ -204,7 +252,7 @@ export function useChat() {
                     args: event.args,
                 };
                 currentToolEvents.current.set(event.toolName + event.step, toolEvent);
-                setCurrentAssistantMsg((prev) =>
+                setAssistantMsg((prev) =>
                     prev
                         ? {
                               ...prev,
@@ -227,7 +275,7 @@ export function useChat() {
                     error: event.success ? undefined : String(event.result),
                 };
                 currentToolEvents.current.set(key, toolEvent);
-                setCurrentAssistantMsg((prev) =>
+                setAssistantMsg((prev) =>
                     prev
                         ? {
                               ...prev,
@@ -249,7 +297,7 @@ export function useChat() {
                     error: event.error,
                 };
                 currentToolEvents.current.set(key, toolEvent);
-                setCurrentAssistantMsg((prev) =>
+                setAssistantMsg((prev) =>
                     prev
                         ? {
                               ...prev,
@@ -263,44 +311,66 @@ export function useChat() {
             // 外置任务计划更新：服务端发来的是全量清单，直接整体替换
             case "plan_update": {
                 currentPlanItems.current = event.items;
-                setCurrentAssistantMsg((prev) =>
+                setAssistantMsg((prev) =>
                     prev ? { ...prev, planItems: event.items } : prev,
                 );
                 break;
             }
 
             // Agent 最终回复：将占位消息固化到消息列表中，清空占位
-            case "assistant":
-                setCurrentAssistantMsg((prev) => {
-                    const msg: ChatMessage = {
-                        id: `assistant-${Date.now()}`,
-                        role: "assistant",
-                        content: event.message,
-                        timestamp: Date.now(),
-                        toolEvents: prev?.toolEvents ?? [],
-                        debugEvents: prev?.debugEvents ?? [],
-                        // 定格本轮的最终计划状态，作为该轮对话的一部分留存展示
-                        planItems: prev?.planItems ?? [],
-                    };
-                    setMessages((prevMsgs) => [...prevMsgs, msg]);
-                    return null; // 清空占位消息
-                });
+            case "assistant": {
+                const pending = assistantMsgRef.current;
+                const msg: ChatMessage = {
+                    id: `assistant-${Date.now()}`,
+                    role: "assistant",
+                    content: event.message,
+                    timestamp: Date.now(),
+                    toolEvents: pending?.toolEvents ?? [],
+                    debugEvents: pending?.debugEvents ?? [],
+                    // 定格本轮的最终计划状态，作为该轮对话的一部分留存展示
+                    planItems: pending?.planItems ?? [],
+                };
+                setAssistantMsg(null);
+                setMessages((prevMsgs) => [...prevMsgs, msg]);
                 break;
+            }
 
-            // Agent 循环正常结束：重置处理和流式状态
+            /**
+             * Agent 循环结束。
+             *
+             * reason 为 final 时占位消息已被 assistant 事件固化，这里无需处理。
+             * 为 max_steps_exceeded 时不会有 assistant 事件：服务端抛出的错误被
+             * server.ts 的 catch 吞掉，只打了日志，前端唯一的告知机会就是这里。
+             */
             case "run_end":
                 setIsProcessing(false);
                 setIsStreaming(false);
+                if (event.reason !== "final") {
+                    antdMessage.warning("已达到最大步数上限，任务未完成");
+                    flushAssistantPlaceholder("（本轮因超出步数上限中止，未产出最终回答）");
+                }
                 break;
 
-            // Agent 循环出错：重置状态并弹出错误提示
+            /**
+             * Agent 循环出错。
+             *
+             * parse_agent_response 是**可恢复**错误：服务端塞入纠正提示后 continue，
+             * 循环还在跑。此时不能复位 isProcessing、更不能清掉占位消息，
+             * 否则后续 tool_* / assistant 事件无处可挂。
+             * 其余 stage（model_generate / confirmation）服务端会直接抛出，本轮终止。
+             */
             case "run_error":
+                if (event.stage === "parse_agent_response") {
+                    antdMessage.warning(`第 ${event.step} 步模型输出解析失败，正在重试`);
+                    break;
+                }
                 setIsProcessing(false);
                 setIsStreaming(false);
                 antdMessage.error(`处理出错: ${event.error}`);
+                flushAssistantPlaceholder("（本轮执行出错，未产出最终回答）");
                 break;
         }
-    }, []);
+    }, [flushAssistantPlaceholder, setAssistantMsg]);
 
     const handleConnected = useCallback(() => {
         antdMessage.success("已连接到服务器");
